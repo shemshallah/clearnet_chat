@@ -1,694 +1,300 @@
 import os
-import json
-import random
-import hashlib
-import base64
-from datetime import timedelta, datetime
-from typing import Optional
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Request, Query
+from pathlib import Path
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import RedirectResponse, JSONResponse, FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
-
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Text, Index, create_engine, inspect, exc, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker, Session
-from sqlalchemy.sql import func
-
-from passlib.context import CryptContext
-from cryptography.fernet import Fernet
-from jose import JWTError, jwt
 import uvicorn
 import logging
+from datetime import datetime
+import httpx
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ============= CONFIGURATION =============
-SECRET_KEY = os.getenv("SECRET_KEY", "quantum-foam-secret-2025-change-in-prod")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./holo_db.db")
+# Configuration
+STATIC_DIR = Path("static")
+TEMPLATES_DIR = Path("templates")
+STATIC_DIR.mkdir(exist_ok=True)
+TEMPLATES_DIR.mkdir(exist_ok=True)
 
-# Render PostgreSQL fix
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+# Env var for backend URLs
+CHAT_BACKEND = os.getenv("CHAT_BACKEND_URL", "https://clearnet-chat-4bal.onrender.com")
 
-# Fallback if empty
-if not DATABASE_URL or DATABASE_URL.strip() == '':
-    logger.warning("DATABASE_URL empty; falling back to SQLite for startup")
-    DATABASE_URL = "sqlite:///./holo_db.db"
-
-CLEARNET_GATE_URL = os.getenv("CLEARNET_GATE_URL", "https://clearnet-gate.onrender.com")
-
-# ============= DATABASE SETUP =============
-try:
-    engine = create_engine(
-        DATABASE_URL,
-        connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
-        pool_pre_ping=True,
-        pool_size=int(os.getenv("SQLALCHEMY_POOL_SIZE", 2)),
-        max_overflow=int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", 3)),
-        pool_timeout=60,
-        pool_recycle=3600
-    )
-    # Test connection
-    with engine.connect() as conn:
-        conn.scalar(text("SELECT 1"))
-    logger.info("✅ Database connection successful")
-except Exception as e:
-    logger.error(f"❌ Database connection failed: {e}")
-    raise
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# ============= MODELS =============
-pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, index=True, nullable=False)
-    domain = Column(String(50), default="quantum", nullable=False)
-    hashed_password = Column(String(255), nullable=False)
-    labels = Column(String(500), default="")
-    email = Column(String(100), unique=True, index=True)
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    contacts = relationship("Contact", back_populates="user", cascade="all, delete-orphan")
-    messages_sent = relationship("Message", foreign_keys="Message.sender_id", back_populates="sender")
-    messages_received = relationship("Message", foreign_keys="Message.receiver_id", back_populates="receiver")
-    emails_sent = relationship("Email", foreign_keys="Email.sender_id", back_populates="sender")
-    emails_received = relationship("Email", foreign_keys="Email.receiver_id", back_populates="receiver")
-
-    def set_password(self, password: str):
-        self.hashed_password = pwd_context.hash(password)
-
-    def verify_password(self, password: str) -> bool:
-        return pwd_context.verify(password, self.hashed_password)
-
-    @property
-    def full_email(self):
-        return f"{self.username}@{self.domain}.foam.computer"
-
-class Contact(Base):
-    __tablename__ = "contacts"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    contact_email = Column(String(100), nullable=False)
-    name = Column(String(100))
-    is_starred = Column(Boolean, default=False)
-    labels = Column(String(200), default="")
-
-    user = relationship("User", back_populates="contacts")
-
-class Message(Base):
-    __tablename__ = "messages"
-
-    id = Column(Integer, primary_key=True, index=True)
-    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    receiver_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    encrypted_content = Column(Text, nullable=False)
-    black_hole_hash = Column(String(128), nullable=False)
-    is_ai = Column(Boolean, default=False)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    is_deleted = Column(Boolean, default=False)
-
-    sender = relationship("User", foreign_keys=[sender_id], back_populates="messages_sent")
-    receiver = relationship("User", foreign_keys=[receiver_id], back_populates="messages_received")
-
-    __table_args__ = (
-        Index('idx_sender_receiver', sender_id, receiver_id),
-        Index('idx_timestamp', timestamp.desc()),
-    )
-
-    @property
-    def content(self):
-        if self.encrypted_content and not self.is_deleted:
-            try:
-                key = derive_key_from_collider(self.black_hole_hash)
-                f = Fernet(key)
-                return f.decrypt(self.encrypted_content.encode()).decode()
-            except Exception:
-                return "[Decryption failed]"
-        return None
-
-class Email(Base):
-    __tablename__ = "emails"
-
-    id = Column(Integer, primary_key=True, index=True)
-    sender_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    receiver_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    subject = Column(String(200), nullable=False)
-    encrypted_body = Column(Text, nullable=False)
-    black_hole_hash = Column(String(128), nullable=False)
-    folder = Column(String(50), default="Inbox")
-    label = Column(String(200), default="")
-    is_starred = Column(Boolean, default=False)
-    is_deleted = Column(Boolean, default=False)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
-
-    sender = relationship("User", foreign_keys=[sender_id], back_populates="emails_sent")
-    receiver = relationship("User", foreign_keys=[receiver_id], back_populates="emails_received")
-
-    __table_args__ = (
-        Index('idx_receiver_folder', receiver_id, folder),
-        Index('idx_email_timestamp', timestamp.desc()),
-    )
-
-    @property
-    def body(self):
-        if self.encrypted_body and not self.is_deleted:
-            try:
-                key = derive_key_from_collider(self.black_hole_hash)
-                f = Fernet(key)
-                return f.decrypt(self.encrypted_body.encode()).decode()
-            except Exception:
-                return "[Decryption failed]"
-        return None
-
-# ============= CRYPTO FUNCTIONS =============
-def derive_key_from_collider(black_hole_hash: str) -> bytes:
-    """Derive encryption key from black hole hash"""
-    key_material = hashlib.pbkdf2_hmac('sha512', black_hole_hash.encode(), b'foam-salt', 100000)[:32]
-    return base64.urlsafe_b64encode(key_material)
-
-def create_black_hole_hash(content: str) -> str:
-    """Generate black hole hash with white hole entropy"""
-    white_hole_seed = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789!@#$', k=64))
-    combined = content + white_hole_seed
-    return hashlib.sha3_512(combined.encode()).hexdigest()
-
-def encrypt_with_collider(content: str) -> tuple:
-    """Encrypt content with collider encryption"""
-    hash_val = create_black_hole_hash(content)
-    key = derive_key_from_collider(hash_val)
-    f = Fernet(key)
-    encrypted = f.encrypt(content.encode()).decode()
-    return encrypted, hash_val
-
-# ============= AUTH =============
-security = HTTPBearer()
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-    
-    user = db.query(User).filter(User.username == username, User.is_active == True).first()
-    if user is None:
-        raise credentials_exception
-    return user
-
-# ============= FASTAPI APP =============
+# Create FastAPI app
 app = FastAPI(
-    title="Clearnet Chat - Quantum Foam Chatroom",
-    description="Secure messaging with quantum collider encryption",
-    version="1.0.0",
-    docs_url=None,  # Disable Swagger UI to avoid pretty-print interactive docs in production
-    redoc_url=None  # Disable ReDoc
+    title="Clearnet Gate - Quantum Foam Gateway",
+    description="Frontend proxy and static server for Quantum Foam Network",
+    version="2.0.0"
 )
 
-# CORS configuration
-allowed_origins = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    CLEARNET_GATE_URL,
-]
+# Templates
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins + ["*"],  # Allow all in production for flexibility
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============= CONNECTION MANAGER =============
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: dict[int, WebSocket] = {}
+# Mount static files (for CSS/JS/images if added)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-    async def connect(self, websocket: WebSocket, user_id: int):
-        await websocket.accept()
-        self.active_connections[user_id] = websocket
+# In-memory simple storage if needed (e.g., for temp files)
+temp_storage = {}
 
-    def disconnect(self, user_id: int):
-        self.active_connections.pop(user_id, None)
+# Helper: Proxy requests to chat backend
+async def proxy_to_chat(request: Request, path: str):
+    """Proxy API/WS requests to chat backend"""
+    backend_url = f"{CHAT_BACKEND}/{path}"
+    
+    # Handle query params
+    params = dict(request.query_params)
+    
+    # Handle body for POST/PUT etc.
+    body = None
+    if request.method in ["POST", "PUT", "PATCH"]:
+        body = await request.body()
+    
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        resp = await client.request(
+            method=request.method,
+            url=backend_url,
+            params=params,
+            content=body,
+            headers={
+                k: v for k, v in request.headers.items()
+                if k.lower() not in ["host", "content-length"]
+            }
+        )
+        return JSONResponse(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers)
+        )
 
-    async def send_personal(self, message: str, user_id: int):
-        if user_id in self.active_connections:
-            try:
-                await self.active_connections[user_id].send_text(message)
-            except Exception:
-                self.disconnect(user_id)
-
-    async def broadcast_to_matches(self, message: str, sender_labels: str, db: Session):
-        sender_label_list = [l.strip() for l in sender_labels.split(',') if l.strip()]
-        for uid, ws in list(self.active_connections.items()):
-            try:
-                user = db.query(User).filter(User.id == uid).first()
-                if user:
-                    user_labels = [l.strip() for l in user.labels.split(',') if l.strip()]
-                    if any(label in user_labels for label in sender_label_list):
-                        await ws.send_text(message)
-            except Exception:
-                self.disconnect(uid)
-
-manager = ConnectionManager()
-
-# ============= API ENDPOINTS =============
-
+# Routes
 @app.get("/")
 async def root():
-    return {
-        "service": "clearnet_chat",
-        "status": "online",
-        "message": "Quantum Foam Chatroom API",
-        "gateway": CLEARNET_GATE_URL
-    }
+    """Serve main chat HTML page"""
+    # Read the HTML file or inline it
+    html_content = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clearnet Chat - Quantum Foam Chatroom</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: linear-gradient(135deg, #0f0f23, #1a1a2e); color: #e0e0e0; margin: 0; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; background: rgba(0,0,0,0.8); border-radius: 10px; padding: 20px; box-shadow: 0 0 20px rgba(0,255,255,0.1); }
+        h1 { text-align: center; color: #00ffff; text-shadow: 0 0 10px #00ffff; }
+        form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
+        input, button { padding: 10px; border: 1px solid #00ffff; border-radius: 5px; background: transparent; color: #e0e0e0; }
+        button { cursor: pointer; background: #00ffff; color: #000; font-weight: bold; }
+        button:hover { box-shadow: 0 0 10px #00ffff; }
+        .chat-container { border: 1px solid #00ffff; height: 400px; overflow-y: scroll; padding: 10px; background: rgba(0,0,0,0.5); border-radius: 5px; margin-bottom: 10px; }
+        .message { margin-bottom: 10px; padding: 5px; border-radius: 5px; }
+        .message.sent { background: rgba(0,255,255,0.1); text-align: right; }
+        .message.received { background: rgba(255,0,255,0.1); }
+        .message.ai { background: rgba(255,165,0,0.2); font-style: italic; }
+        #messageInput { width: 70%; }
+        #sendButton { width: 25%; }
+        .hidden { display: none; }
+        .error { color: #ff0000; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌊 Quantum Foam Chatroom</h1>
+        
+        <!-- Login/Register Form -->
+        <div id="authForm">
+            <h2 id="formTitle">Login</h2>
+            <form id="authFormElement">
+                <input type="text" id="username" placeholder="Username" required>
+                <input type="password" id="password" placeholder="Password" required>
+                <input type="email" id="email" placeholder="Email (for register)" style="display: none;">
+                <label><input type="checkbox" id="rememberMe"> Remember Me</label>
+                <button type="submit" id="submitBtn">Login</button>
+                <button type="button" id="toggleForm">Register Instead</button>
+            </form>
+            <p id="errorMsg" class="error hidden"></p>
+        </div>
+
+        <!-- Chat Interface -->
+        <div id="chatInterface" class="hidden">
+            <div class="chat-container" id="messages"></div>
+            <input type="text" id="messageInput" placeholder="Type a message...">
+            <button id="sendButton">Send</button>
+            <button id="logoutBtn">Logout</button>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '/api';  // Proxied to backend
+        const WS_URL = 'wss://clearnet-chat-4bal.onrender.com/ws/chat';  // Direct to backend for WS
+        let ws = null;
+        let token = localStorage.getItem('token') || null;
+        let currentUser = null;
+
+        // Toggle between login and register
+        document.getElementById('toggleForm').onclick = () => {
+            const formTitle = document.getElementById('formTitle');
+            const emailInput = document.getElementById('email');
+            const submitBtn = document.getElementById('submitBtn');
+            if (formTitle.textContent === 'Login') {
+                formTitle.textContent = 'Register';
+                emailInput.style.display = 'block';
+                submitBtn.textContent = 'Register';
+            } else {
+                formTitle.textContent = 'Login';
+                emailInput.style.display = 'none';
+                submitBtn.textContent = 'Login';
+            }
+        };
+
+        // Handle auth submit
+        document.getElementById('authFormElement').onsubmit = async (e) => {
+            e.preventDefault();
+            const isRegister = document.getElementById('formTitle').textContent === 'Register';
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const email = document.getElementById('email').value;
+            const rememberMe = document.getElementById('rememberMe').checked;
+
+            const endpoint = isRegister ? '/register' : '/login';
+            const body = isRegister ? { username, password, email } : { username, password, remember_me: rememberMe };
+
+            try {
+                const res = await fetch(`${API_BASE}${endpoint}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    token = data.token;
+                    currentUser = { username: data.username || username, email: data.email };
+                    if (rememberMe) localStorage.setItem('token', token);
+                    showChat();
+                } else {
+                    showError(data.message || 'Authentication failed');
+                }
+            } catch (err) {
+                showError('Network error: ' + err.message);
+            }
+        };
+
+        function showError(msg) {
+            const errorEl = document.getElementById('errorMsg');
+            errorEl.textContent = msg;
+            errorEl.classList.remove('hidden');
+        }
+
+        function showChat() {
+            document.getElementById('authForm').classList.add('hidden');
+            document.getElementById('chatInterface').classList.remove('hidden');
+            connectWebSocket();
+        }
+
+        function connectWebSocket() {
+            if (!token) return;
+            ws = new WebSocket(`${WS_URL}?token=${token}`);
+            ws.onopen = () => console.log('Connected to chat');
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                addMessage(msg);
+            };
+            ws.onclose = () => setTimeout(connectWebSocket, 3000);  // Reconnect
+            ws.onerror = (err) => console.error('WS error:', err);
+        }
+
+        function addMessage(msg) {
+            const messagesEl = document.getElementById('messages');
+            const div = document.createElement('div');
+            div.className = `message ${msg.sender_id === currentUser.id ? 'sent' : msg.is_ai ? 'ai' : 'received'}`;
+            div.innerHTML = `<strong>${msg.sender || 'AI'}:</strong> ${msg.content || msg.body} <small>${msg.timestamp}</small>`;
+            messagesEl.appendChild(div);
+            messagesEl.scrollTop = messagesEl.scrollHeight;
+        }
+
+        // Send message
+        document.getElementById('sendButton').onclick = () => sendMessage();
+        document.getElementById('messageInput').onkeypress = (e) => { if (e.key === 'Enter') sendMessage(); };
+
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const content = input.value.trim();
+            if (!content || !ws) return;
+            ws.send(JSON.stringify({ content }));
+            input.value = '';
+        }
+
+        // Logout
+        document.getElementById('logoutBtn').onclick = () => {
+            localStorage.removeItem('token');
+            token = null;
+            ws?.close();
+            document.getElementById('chatInterface').classList.add('hidden');
+            document.getElementById('authForm').classList.remove('hidden');
+            document.getElementById('messages').innerHTML = '';
+        };
+
+        // Auto-login if token exists
+        if (token) {
+            showChat();
+        }
+    </script>
+</body>
+</html>
+    """
+    return HTMLResponse(content=html_content)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "clearnet_chat"}
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "version": "2.0.0",
+        "backend": CHAT_BACKEND
+    }
 
-# Registration
-@app.post("/api/register")
-async def register(
-    request: Request,
-    db: Session = Depends(get_db)
-):
+# Proxy API routes to chat backend
+@app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_api(path: str, request: Request):
+    """Proxy all API calls to chat backend"""
     try:
-        data = await request.json()
-        username = data.get("username", "").strip()
-        password = data.get("password", "")
-        domain = data.get("domain", "quantum").strip()
-        labels = data.get("labels", "").strip()
-
-        if not username or not password:
-            raise HTTPException(status_code=400, detail="Username and password required")
-
-        if db.query(User).filter(User.username == username).first():
-            raise HTTPException(status_code=400, detail="Username already taken")
-
-        user = User(username=username, domain=domain, labels=labels)
-        user.set_password(password)
-        user.email = user.full_email
-        
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-        token = create_access_token(data={"sub": username}, expires_delta=timedelta(days=7))
-        
-        return {
-            "token": token,
-            "email": user.email,
-            "message": "Welcome to Foam Computer! Your messages are secured via quantum colliders."
-        }
-    except HTTPException:
-        raise
+        return await proxy_to_chat(request, f"api/{path}")
     except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Backend unavailable")
 
-# Login
-@app.post("/api/login")
-async def login(
-    request: Request,
-    db: Session = Depends(get_db)
-):
-    try:
-        data = await request.json()
-        username = data.get("username", "").strip()
-        password = data.get("password", "")
-        remember_me = data.get("remember_me", False)
+# Fallback for other routes (e.g., /ws/* - redirect to backend for now)
+@app.get("/{path:path}")
+async def catch_all(path: str):
+    """Catch-all redirect or proxy"""
+    if path.startswith("ws/"):
+        # Redirect WS to backend
+        backend_ws = f"wss://{CHAT_BACKEND.replace('https://', '')}/{path}"
+        raise HTTPException(status_code=307, detail=f"WebSocket redirect to {backend_ws}")
+    # Else, serve index or static
+    file_path = STATIC_DIR / path
+    if file_path.exists():
+        return FileResponse(file_path)
+    return RedirectResponse(url="/", status_code=302)
 
-        user = db.query(User).filter(User.username == username).first()
-        if not user or not user.verify_password(password):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="Account disabled")
-
-        expires = timedelta(days=7) if remember_me else timedelta(minutes=30)
-        token = create_access_token(data={"sub": username}, expires_delta=expires)
-
-        return {
-            "token": token,
-            "email": user.email,
-            "username": user.username,
-            "message": "Login successful"
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Forgot Password
-@app.post("/api/forget-password")
-async def forget_password(request: Request, db: Session = Depends(get_db)):
-    try:
-        data = await request.json()
-        username = data.get("username", "").strip()
-
-        user = db.query(User).filter(User.username == username).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-
-        new_pass = ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$', k=16))
-        user.set_password(new_pass)
-        db.commit()
-
-        return {
-            "new_password": new_pass,
-            "message": "Password reset. Change it immediately in settings."
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# WebSocket Chat (Fixed: Token via query param)
-@app.websocket("/ws/chat")
-async def chat_websocket(websocket: WebSocket, token: str = Query(...)):
-    db = SessionLocal()
-    user = None
-    try:
-        # Validate token
-        try:
-            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-            username = payload.get("sub")
-            user = db.query(User).filter(User.username == username, User.is_active == True).first()
-            if not user:
-                await websocket.close(code=1008)
-                return
-        except JWTError:
-            await websocket.close(code=1008)
-            return
-
-        await manager.connect(websocket, user.id)
-
-        while True:
-            data = await websocket.receive_text()
-            parsed = json.loads(data)
-            content = parsed.get("content", "")
-            receiver_id = parsed.get("receiver_id")
-
-            if not content:
-                continue
-
-            # Encrypt message
-            encrypted, bhash = encrypt_with_collider(content)
-            message = Message(
-                sender_id=user.id,
-                receiver_id=receiver_id,
-                encrypted_content=encrypted,
-                black_hole_hash=bhash
-            )
-            db.add(message)
-            db.commit()
-
-            # AI response
-            if "/ai" in content.lower() or any("ai" in label.lower() for label in user.labels.split(',') if label.strip()):
-                ai_resp = f"Grok Clone: Resonating with your query through foam... {content.upper()}"
-                await manager.send_personal(
-                    json.dumps({"content": ai_resp, "is_ai": True, "sender": "AI"}),
-                    user.id
-                )
-
-            # Send to receiver or broadcast
-            response_data = {
-                "content": content,
-                "sender": user.username,
-                "sender_id": user.id,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            
-            if receiver_id:
-                await manager.send_personal(json.dumps(response_data), int(receiver_id))
-            else:
-                await manager.broadcast_to_matches(json.dumps(response_data), user.labels, db)
-
-    except WebSocketDisconnect:
-        if user:
-            manager.disconnect(user.id)
-    except Exception as e:
-        logger.error(f"WebSocket error: {e}")
-        if user:
-            manager.disconnect(user.id)
-    finally:
-        db.close()
-
-# Inbox - Get emails
-@app.get("/api/inbox")
-async def get_inbox(
-    search: str = "",
-    folder: str = "Inbox",
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        query = db.query(Email).filter(
-            Email.receiver_id == current_user.id,
-            Email.folder == folder,
-            Email.is_deleted == False
-        )
-
-        if search:
-            query = query.filter(
-                (Email.subject.like(f"%{search}%")) | 
-                (Email.encrypted_body.like(f"%{search}%"))
-            )
-
-        emails = query.order_by(Email.timestamp.desc()).limit(100).all()
-
-        return [{
-            "id": e.id,
-            "subject": e.subject,
-            "body": e.body[:200] if e.body else "",
-            "folder": e.folder,
-            "label": e.label,
-            "is_starred": e.is_starred,
-            "timestamp": e.timestamp.isoformat(),
-            "sender_id": e.sender_id
-        } for e in emails]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Inbox - Send email
-@app.post("/api/inbox/send")
-async def send_email(
-    request: Request,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        data = await request.json()
-        receiver_email = data.get("receiver_email", "").strip()
-        subject = data.get("subject", "").strip()
-        body = data.get("body", "")
-
-        if not receiver_email or not subject:
-            raise HTTPException(status_code=400, detail="Receiver and subject required")
-
-        receiver = db.query(User).filter(User.email == receiver_email).first()
-        if not receiver:
-            raise HTTPException(status_code=404, detail="Receiver not found")
-
-        encrypted, bhash = encrypt_with_collider(body)
-        email = Email(
-            sender_id=current_user.id,
-            receiver_id=receiver.id,
-            subject=subject,
-            encrypted_body=encrypted,
-            black_hole_hash=bhash
-        )
-        db.add(email)
-        db.commit()
-
-        return {"message": "Email sent successfully"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Delete email
-@app.delete("/api/inbox/{email_id}")
-async def delete_email(
-    email_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        email = db.query(Email).filter(
-            Email.id == email_id,
-            Email.receiver_id == current_user.id
-        ).first()
-        
-        if not email:
-            raise HTTPException(status_code=404, detail="Email not found")
-
-        email.is_deleted = True
-        db.commit()
-
-        return {"message": "Email deleted"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Contacts - Add
-@app.post("/api/contacts")
-async def add_contact(
-    request: Request,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        data = await request.json()
-        contact_email = data.get("contact_email", "").strip()
-        name = data.get("name", "").strip()
-
-        if not contact_email:
-            raise HTTPException(status_code=400, detail="Contact email required")
-
-        contact = Contact(
-            user_id=current_user.id,
-            contact_email=contact_email,
-            name=name
-        )
-        db.add(contact)
-        db.commit()
-
-        return {"message": "Contact added"}
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Contacts - Import
-@app.post("/api/contacts/import")
-async def import_contacts(
-    request: Request,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        data = await request.json()
-        contacts_data = data.get("data", "")
-
-        lines = contacts_data.strip().split('\n')
-        imported = 0
-
-        for line in lines:
-            if ',' in line:
-                parts = line.split(',', 1)
-                email = parts[0].strip()
-                name = parts[1].strip() if len(parts) > 1 else ""
-                
-                if email:
-                    contact = Contact(
-                        user_id=current_user.id,
-                        contact_email=email,
-                        name=name
-                    )
-                    db.add(contact)
-                    imported += 1
-
-        db.commit()
-        return {"message": f"Imported {imported} contacts"}
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Get contacts
-@app.get("/api/contacts")
-async def get_contacts(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        contacts = db.query(Contact).filter(Contact.user_id == current_user.id).all()
-        return [{
-            "id": c.id,
-            "contact_email": c.contact_email,
-            "name": c.name,
-            "is_starred": c.is_starred,
-            "labels": c.labels
-        } for c in contacts]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Global exception handler
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Error: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Internal server error",
-            "timestamp": datetime.now().isoformat()
-        }
-    )
-
-# ============= STARTUP =============
 @app.on_event("startup")
 async def startup_event():
-    try:
-        # Check if tables already exist
-        inspector = inspect(engine)
-        if not inspector.has_table("users", schema=inspector.default_schema_name):
-            Base.metadata.create_all(bind=engine)
-            logger.info("✅ Database tables created")
-        else:
-            logger.info("✅ Database tables already exist")
-        
-        db_type = "PostgreSQL" if "postgresql" in DATABASE_URL else "SQLite"
-        logger.info(f"✅ Clearnet Chat running on {db_type}")
-    except Exception as e:
-        logger.error(f"❌ Startup failed: {e}")
-        # Don't raise, let app start anyway - tables can be created on first request if needed
-        logger.info("🚀 App starting despite startup error")
+    """Initialize app state"""
+    logger.info(f"🚀 Gate started, proxying to {CHAT_BACKEND}")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-        access_log=True
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")
