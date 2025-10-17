@@ -23,3 +23,5 @@ databases:
     plan: free
     databaseName: clearnet_chat
     user: clearnet_chat_user
+The key is line 8:
+startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
