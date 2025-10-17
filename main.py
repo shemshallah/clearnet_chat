@@ -223,7 +223,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     except JWTError:
         raise credentials_exception
     
-    user = db.query(User).filter(User.username == username, User.is_active == True).filter().first()
+    user = db.query(User).filter(User.username == username, User.is_active == True).first()
     if user is None:
         raise credentials_exception
     return user
@@ -232,7 +232,9 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 app = FastAPI(
     title="Clearnet Chat - Quantum Foam Chatroom",
     description="Secure messaging with quantum collider encryption",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url=None,  # Disable Swagger UI to avoid pretty-print interactive docs in production
+    redoc_url=None  # Disable ReDoc
 )
 
 # CORS configuration
@@ -666,10 +668,6 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.on_event("startup")
 async def startup_event():
     try:
-        # Test DB again
-        with engine.connect() as conn:
-            conn.scalar(text("SELECT 1"))
-        
         # Check if tables already exist
         inspector = inspect(engine)
         if not inspector.has_table("users", schema=inspector.default_schema_name):
