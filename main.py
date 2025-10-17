@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Text, Index, create_engine, inspect, exc
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, Text, Index, create_engine, inspect, exc, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker, Session
 from sqlalchemy.sql import func
@@ -56,7 +56,7 @@ try:
     )
     # Test connection
     with engine.connect() as conn:
-        conn.execute("SELECT 1")
+        conn.scalar(text("SELECT 1"))
     logger.info("✅ Database connection successful")
 except Exception as e:
     logger.error(f"❌ Database connection failed: {e}")
@@ -223,7 +223,7 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     except JWTError:
         raise credentials_exception
     
-    user = db.query(User).filter(User.username == username, User.is_active == True).first()
+    user = db.query(User).filter(User.username == username, User.is_active == True).filter().first()
     if user is None:
         raise credentials_exception
     return user
@@ -668,7 +668,7 @@ async def startup_event():
     try:
         # Test DB again
         with engine.connect() as conn:
-            conn.execute("SELECT 1")
+            conn.scalar(text("SELECT 1"))
         
         # Check if tables already exist
         inspector = inspect(engine)
