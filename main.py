@@ -49,8 +49,8 @@ try:
         DATABASE_URL,
         connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
         pool_pre_ping=True,
-        pool_size=int(os.getenv("SQLALCHEMY_POOL_SIZE", 5)),
-        max_overflow=int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", 10)),
+        pool_size=int(os.getenv("SQLALCHEMY_POOL_SIZE", 2)),
+        max_overflow=int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", 3)),
         pool_timeout=60,
         pool_recycle=3600
     )
@@ -437,7 +437,7 @@ async def chat_websocket(websocket: WebSocket, token: str = Query(...)):
             db.commit()
 
             # AI response
-            if "/ai" in content.lower() or any("ai" in label.lower() for label in user.labels.split(',')):
+            if "/ai" in content.lower() or any("ai" in label.lower() for label in user.labels.split(',') if label.strip()):
                 ai_resp = f"Grok Clone: Resonating with your query through foam... {content.upper()}"
                 await manager.send_personal(
                     json.dumps({"content": ai_resp, "is_ai": True, "sender": "AI"}),
@@ -453,7 +453,7 @@ async def chat_websocket(websocket: WebSocket, token: str = Query(...)):
             }
             
             if receiver_id:
-                await manager.send_personal(json.dumps(response_data), receiver_id)
+                await manager.send_personal(json.dumps(response_data), int(receiver_id))
             else:
                 await manager.broadcast_to_matches(json.dumps(response_data), user.labels, db)
 
