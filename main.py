@@ -675,6 +675,131 @@ if __name__ == "__main__":
         port=port,
         log_level="info",
         access_log=True
+    )
+        return {"message": "Email deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Contacts - Add
+@app.post("/api/contacts")
+async def add_contact(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        data = await request.json()
+        contact_email = data.get("contact_email", "").strip()
+        name = data.get("name", "").strip()
+
+        if not contact_email:
+            raise HTTPException(status_code=400, detail="Contact email required")
+
+        contact = Contact(
+            user_id=current_user.id,
+            contact_email=contact_email,
+            name=name
+        )
+        db.add(contact)
+        db.commit()
+
+        return {"message": "Contact added"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Contacts - Import
+@app.post("/api/contacts/import")
+async def import_contacts(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        data = await request.json()
+        contacts_data = data.get("data", "")
+
+        lines = contacts_data.strip().split('\n')
+        imported = 0
+
+        for line in lines:
+            if ',' in line:
+                parts = line.split(',', 1)
+                email = parts[0].strip()
+                name = parts[1].strip() if len(parts) > 1 else ""
+                
+                if email:
+                    contact = Contact(
+                        user_id=current_user.id,
+                        contact_email=email,
+                        name=name
+                    )
+                    db.add(contact)
+                    imported += 1
+
+        db.commit()
+        return {"message": f"Imported {imported} contacts"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Get contacts
+@app.get("/api/contacts")
+async def get_contacts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        contacts = db.query(Contact).filter(Contact.user_id == current_user.id).all()
+        return [{
+            "id": c.id,
+            "contact_email": c.contact_email,
+            "name": c.name,
+            "is_starred": c.is_starred,
+            "labels": c.labels
+        } for c in contacts]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Error: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+# ============= STARTUP =============
+@app.on_event("startup")
+async def startup_event():
+    # Check if tables already exist to avoid recreating on every worker startup
+    inspector = inspect(engine)
+    if not inspector.has_table("users"):
+        Base.metadata.create_all(bind=engine)
+        logger.info("✅ Database tables created")
+    else:
+        logger.info("✅ Database tables already exist")
+    
+    db_type = DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else 'SQLite'
+    logger.info(f"✅ Clearnet Chat running on DATABASE: {db_type}")
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        access_log=True
     )                ai_resp = f"Grok Clone: Resonating with your query through foam... {content.upper()}"
                 await manager.send_personal(
                     json.dumps({"content": ai_resp, "is_ai": True, "sender": "AI"}),
