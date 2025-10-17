@@ -6,7 +6,7 @@ import base64
 from datetime import timedelta, datetime
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
@@ -375,10 +375,11 @@ async def forget_password(request: Request, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-# WebSocket Chat
+# WebSocket Chat (Fixed: Token via query param)
 @app.websocket("/ws/chat")
-async def chat_websocket(websocket: WebSocket, token: str):
+async def chat_websocket(websocket: WebSocket, token: str = Query(...)):
     db = SessionLocal()
+    user = None
     try:
         # Validate token
         try:
@@ -436,10 +437,12 @@ async def chat_websocket(websocket: WebSocket, token: str):
                 await manager.broadcast_to_matches(json.dumps(response_data), user.labels, db)
 
     except WebSocketDisconnect:
-        manager.disconnect(user.id)
+        if user:
+            manager.disconnect(user.id)
     except Exception as e:
         print(f"WebSocket error: {e}")
-        manager.disconnect(user.id)
+        if user:
+            manager.disconnect(user.id)
     finally:
         db.close()
 
@@ -625,6 +628,17 @@ async def get_contacts(
         } for c in contacts]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "timestamp": datetime.now().isoformat()
+        }
+    )
 
 # ============= STARTUP =============
 @app.on_event("startup")
