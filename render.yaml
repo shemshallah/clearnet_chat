@@ -5,7 +5,7 @@ services:
     region: oregon
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn main --host 0.0.0.0 --port $PORT
     envVars:
       - key: SECRET_KEY
         generateValue: true
@@ -24,5 +24,5 @@ databases:
     databaseName: clearnet_chat
     user: clearnet_chat_user
 The key is line 8:
-startCommand: gunicorn main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
+startCommand: gunicorn main --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:$PORT
 
