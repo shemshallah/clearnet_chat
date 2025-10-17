@@ -24,6 +24,6 @@ services:
 
 databases:
   - name: clearnet-chat-db
+    databaseName: clearnet_chat_db
     plan: free
-    databaseName: clearnet_chat
-    user: clearnet_chat_user
+    region: oregon
