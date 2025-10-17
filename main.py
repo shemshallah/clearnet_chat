@@ -20,6 +20,11 @@ from passlib.context import CryptContext
 from cryptography.fernet import Fernet
 from jose import JWTError, jwt
 import uvicorn
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ============= CONFIGURATION =============
 SECRET_KEY = os.getenv("SECRET_KEY", "quantum-foam-secret-2025-change-in-prod")
@@ -31,6 +36,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./holo_db.db")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
+# Fallback if empty
+if not DATABASE_URL or DATABASE_URL.strip() == '':
+    logger.warning("DATABASE_URL empty; falling back to SQLite for startup")
+    DATABASE_URL = "sqlite:///./holo_db.db"
+
 CLEARNET_GATE_URL = os.getenv("CLEARNET_GATE_URL", "https://clearnet-gate.onrender.com")
 
 # ============= DATABASE SETUP =============
@@ -38,8 +48,8 @@ engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {},
     pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20
+    pool_size=int(os.getenv("SQLALCHEMY_POOL_SIZE", 5)),
+    max_overflow=int(os.getenv("SQLALCHEMY_MAX_OVERFLOW", 10))
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -440,7 +450,7 @@ async def chat_websocket(websocket: WebSocket, token: str = Query(...)):
         if user:
             manager.disconnect(user.id)
     except Exception as e:
-        print(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}")
         if user:
             manager.disconnect(user.id)
     finally:
@@ -513,6 +523,151 @@ async def send_email(
         db.add(email)
         db.commit()
 
+        return {"message": "Email sent successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Delete email
+@app.delete("/api/inbox/{email_id}")
+async def delete_email(
+    email_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        email = db.query(Email).filter(
+            Email.id == email_id,
+            Email.receiver_id == current_user.id
+        ).first()
+        
+        if not email:
+            raise HTTPException(status_code=404, detail="Email not found")
+
+        email.is_deleted = True
+        db.commit()
+
+        return {"message": "Email deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Contacts - Add
+@app.post("/api/contacts")
+async def add_contact(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        data = await request.json()
+        contact_email = data.get("contact_email", "").strip()
+        name = data.get("name", "").strip()
+
+        if not contact_email:
+            raise HTTPException(status_code=400, detail="Contact email required")
+
+        contact = Contact(
+            user_id=current_user.id,
+            contact_email=contact_email,
+            name=name
+        )
+        db.add(contact)
+        db.commit()
+
+        return {"message": "Contact added"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Contacts - Import
+@app.post("/api/contacts/import")
+async def import_contacts(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        data = await request.json()
+        contacts_data = data.get("data", "")
+
+        lines = contacts_data.strip().split('\n')
+        imported = 0
+
+        for line in lines:
+            if ',' in line:
+                parts = line.split(',', 1)
+                email = parts[0].strip()
+                name = parts[1].strip() if len(parts) > 1 else ""
+                
+                if email:
+                    contact = Contact(
+                        user_id=current_user.id,
+                        contact_email=email,
+                        name=name
+                    )
+                    db.add(contact)
+                    imported += 1
+
+        db.commit()
+        return {"message": f"Imported {imported} contacts"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Get contacts
+@app.get("/api/contacts")
+async def get_contacts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        contacts = db.query(Contact).filter(Contact.user_id == current_user.id).all()
+        return [{
+            "id": c.id,
+            "contact_email": c.contact_email,
+            "name": c.name,
+            "is_starred": c.is_starred,
+            "labels": c.labels
+        } for c in contacts]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Global exception handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Error: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+# ============= STARTUP =============
+@app.on_event("startup")
+async def startup_event():
+    Base.metadata.create_all(bind=engine)
+    logger.info("✅ Database tables created")
+    db_type = DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else 'SQLite'
+    logger.info(f"✅ Clearnet Chat running on DATABASE: {db_type}")
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        access_log=True
+    )
         return {"message": "Email sent successfully"}
     except HTTPException:
         raise
